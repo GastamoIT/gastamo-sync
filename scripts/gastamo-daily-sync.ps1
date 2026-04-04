@@ -34,7 +34,7 @@ Write-Log "============================================"
 $yesterday    = (Get-Date).AddDays(-1).ToString("yyyyMMdd")
 $businessDate = $yesterday
 $startUtc     = [Uri]::EscapeDataString("$(Get-Date -Format 'yyyy-MM-dd' -Date (Get-Date).AddDays(-0))T07:00:00.000+0000")
-$endUtc       = [Uri]::EscapeDataString("$(Get-Date -Format 'yyyy-MM-dd')T07:00:00.000+0000")
+$endUtc       = [Uri]::EscapeDataString("$(Get-Date -Format 'yyyy-MM-dd' -Date (Get-Date).AddDays(1))T07:00:00.000+0000")
 
 Write-Log "Business date: $businessDate"
 Write-Log "UTC range: $startUtc to $endUtc"
