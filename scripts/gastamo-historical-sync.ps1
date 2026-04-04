@@ -179,65 +179,76 @@ function Build-SelectionRow($sel, $checkId, $orderId, $locationId, $parentToastG
   }
 }
 
+# Safely fetch one page; returns a result hashtable, never throws
+function Invoke-OrderPage($pageUrl, $pageHeaders) {
+  try {
+    $resp    = Invoke-WebRequest -Uri $pageUrl -UseBasicParsing -Headers $pageHeaders -ErrorAction Stop
+    $sc      = [int]$resp.StatusCode
+    $nextUrl = Get-NextPageUrl $resp.Headers["link"]
+    $orders  = $resp.Content | ConvertFrom-Json
+    return @{ orders = $orders; nextUrl = $nextUrl; statusCode = $sc; ok = $true }
+  } catch {
+    $sc = 0; try { $sc = [int]$_.Exception.Response.StatusCode } catch {}
+    return @{ orders = @(); nextUrl = $null; statusCode = $sc; ok = $false; error = $_.Exception.Message }
+  }
+}
+
+# Fetch all pages for a time window; returns a result hashtable, never throws
+function Invoke-OrderWindow($startEsc, $endEsc, $winHeaders) {
+  $all = @()
+  $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startEsc&endDate=$endEsc&pageSize=100"
+  do {
+    $r = Invoke-OrderPage $url $winHeaders
+    if (-not $r.ok) {
+      return @{ orders = @(); failed = $true; statusCode = $r.statusCode; error = $r.error }
+    }
+    $all += $r.orders
+    $url  = $r.nextUrl
+  } while ($url)
+  return @{ orders = $all; failed = $false }
+}
+
 # Fetches all orders for a location+day, retrying with 4-hour sub-windows on 500 errors
-function Get-OrdersBulkResilient($locGuid, $token, $startUtc, $endUtc, $locName) {
-  $headers = @{
-    Authorization                  = "Bearer $token"
+function Get-OrdersBulkResilient($locGuid, $authToken, $startUtc, $endUtc, $locName) {
+  $hdrs = @{
+    Authorization                  = "Bearer $authToken"
     "Toast-Restaurant-External-ID" = $locGuid
   }
 
-  # Helper: safely extract HTTP status code from a caught exception
-  function Get-StatusCode($err) {
-    try { return [int]$err.Exception.Response.StatusCode } catch { return 0 }
+  # Attempt 1: full day window
+  $attempt = Invoke-OrderWindow $startUtc $endUtc $hdrs
+  if (-not $attempt.failed) { return $attempt.orders }
+
+  # Non-500 errors (401, 403, network) — log and bail, don't chunk-retry
+  if ($attempt.statusCode -ne 500 -and $attempt.statusCode -ne 0) {
+    Write-Log "  ERROR $locName ordersBulk HTTP $($attempt.statusCode): $($attempt.error)" Red
+    return @()
   }
 
-  # First try the full window
-  $fullWindowFailed = $false
-  try {
-    $allOrders = @()
-    $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-    do {
-      $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers
-      $allOrders += ($response.Content | ConvertFrom-Json)
-      $url = Get-NextPageUrl $response.Headers["link"]
-    } while ($url)
-    return $allOrders
-  } catch {
-    $sc = Get-StatusCode $_
-    if ($sc -ne 500) { throw }
-    $fullWindowFailed = $true
-    Write-Log "  WARN $locName full-day fetch 500 — retrying in 4-hour windows" Yellow
-    Start-Sleep -Seconds 2
-  }
+  Write-Log "  WARN $locName full-day 500 — retrying in 4-hour windows" Yellow
+  Start-Sleep -Seconds 3
 
-  if (-not $fullWindowFailed) { return @() }
+  # Attempt 2: split into 4-hour chunks
+  # Derive window bounds from $script:processDate (set in the main date loop)
+  $wStart     = $script:processDate.AddHours(7)       # 07:00 UTC = midnight MT
+  $wEnd       = $script:processDate.AddDays(1).AddHours(7)
+  $allOrders  = @()
+  $cStart     = $wStart
 
-  # Fallback: split into 4-hour sub-windows using the raw DateTime objects already in scope
-  # $startUtc / $endUtc are URL-encoded strings like "2026-03-07T07%3A00%3A00..."
-  # Re-derive from $processDate which is in scope from the caller
-  $windowStart = $processDate.AddHours(7)   # 07:00 UTC = midnight MT
-  $windowEnd   = $processDate.AddDays(1).AddHours(7)
+  while ($cStart -lt $wEnd) {
+    $cEnd  = $cStart.AddHours(4)
+    if ($cEnd -gt $wEnd) { $cEnd = $wEnd }
+    $csEsc = [Uri]::EscapeDataString($cStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff+0000"))
+    $ceEsc = [Uri]::EscapeDataString($cEnd.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff+0000"))
 
-  $allOrders = @()
-  $chunkStart = $windowStart
-  while ($chunkStart -lt $windowEnd) {
-    $chunkEnd = $chunkStart.AddHours(4)
-    if ($chunkEnd -gt $windowEnd) { $chunkEnd = $windowEnd }
-    $csEsc = [Uri]::EscapeDataString($chunkStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff+0000"))
-    $ceEsc = [Uri]::EscapeDataString($chunkEnd.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff+0000"))
-    try {
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$csEsc&endDate=$ceEsc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
-      Write-Log "  INFO $locName chunk $($chunkStart.ToString('HH:mm'))-$($chunkEnd.ToString('HH:mm')) OK ($($allOrders.Count) so far)" Cyan
-    } catch {
-      $sc = Get-StatusCode $_
-      Write-Log "  ERROR $locName chunk $($chunkStart.ToString('HH:mm'))-$($chunkEnd.ToString('HH:mm')) HTTP $sc : $($_.Exception.Message)" Red
+    $chunk = Invoke-OrderWindow $csEsc $ceEsc $hdrs
+    if ($chunk.failed) {
+      Write-Log "  ERROR $locName chunk $($cStart.ToString('HH:mm'))-$($cEnd.ToString('HH:mm')) HTTP $($chunk.statusCode): $($chunk.error)" Red
+    } else {
+      $allOrders += $chunk.orders
+      Write-Log "  INFO $locName chunk $($cStart.ToString('HH:mm'))-$($cEnd.ToString('HH:mm')) OK (+$($chunk.orders.Count) orders)" Cyan
     }
-    $chunkStart = $chunkEnd
+    $cStart = $cEnd
     Start-Sleep -Milliseconds 500
   }
   return $allOrders
@@ -270,6 +281,7 @@ $grandTotalCashEntries  = 0
 $grandTotalDeposits     = 0
 
 foreach ($processDate in $datesToProcess) {
+  $script:processDate = $processDate
   $businessDate = $processDate.ToString("yyyyMMdd")
   $startUtc     = [Uri]::EscapeDataString("$($processDate.ToString('yyyy-MM-dd'))T07:00:00.000+0000")
   $endUtc       = [Uri]::EscapeDataString("$($processDate.AddDays(1).ToString('yyyy-MM-dd'))T07:00:00.000+0000")
@@ -457,13 +469,18 @@ foreach ($processDate in $datesToProcess) {
 
       $itemIdMap2 = @{}
       if ($topLevel.Count -gt 0) {
-        $topLevelOrderIds = ($topLevel | ForEach-Object { $_['order_id'] } | Select-Object -Unique) -join ","
-        $offset2 = 0
-        do {
-          $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&order_id=in.($topLevelOrderIds)&limit=1000&offset=$offset2" -Headers $supabaseHeaders
-          foreach ($item in $itemResponse) { $itemIdMap2[$item.toast_selection_guid] = $item.id }
-          $offset2 += 1000
-        } while ($itemResponse.Count -eq 1000)
+        $tlOrderIds = @($topLevel | ForEach-Object { $_['order_id'] } | Select-Object -Unique)
+        $idChunkSize2 = 50
+        for ($oidx2 = 0; $oidx2 -lt $tlOrderIds.Count; $oidx2 += $idChunkSize2) {
+          $idSlice2 = $tlOrderIds[$oidx2..([Math]::Min($oidx2 + $idChunkSize2 - 1, $tlOrderIds.Count - 1))]
+          $inList2  = $idSlice2 -join ","
+          $offset2  = 0
+          do {
+            $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&order_id=in.($inList2)&limit=1000&offset=$offset2" -Headers $supabaseHeaders
+            foreach ($item in $itemResponse) { $itemIdMap2[$item.toast_selection_guid] = $item.id }
+            $offset2 += 1000
+          } while ($itemResponse.Count -eq 1000)
+        }
       }
 
       $resolvedModifiers = $modifiers | ForEach-Object {
@@ -547,15 +564,16 @@ foreach ($processDate in $datesToProcess) {
   # 5. TOAST DISCOUNTS
   # ============================================================
   Write-Log "--- Discounts ---" Cyan
-  # Scope item lookup to this day's order IDs — avoids a full-table scan / Supabase statement timeout
-  # $orderIdMap is already populated above and contains only this day's orders
   $itemIdMap = @{}
-  if ($orderIdMap.Count -gt 0) {
-    # Build a comma-separated list of supabase order IDs for this day
-    $dayOrderIds = ($orderIdMap.Values | Select-Object -Unique) -join ","
-    $offset = 0
+  $uniqueOrderIds = @($orderIdMap.Values | Select-Object -Unique)
+  # Chunk the order ID list - large in() lists can exceed URI length limits in PowerShell
+  $idChunkSize = 50
+  for ($oidx = 0; $oidx -lt $uniqueOrderIds.Count; $oidx += $idChunkSize) {
+    $idSlice = $uniqueOrderIds[$oidx..([Math]::Min($oidx + $idChunkSize - 1, $uniqueOrderIds.Count - 1))]
+    $inList  = $idSlice -join ","
+    $offset  = 0
     do {
-      $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&order_id=in.($dayOrderIds)&limit=1000&offset=$offset" -Headers $supabaseHeaders
+      $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&order_id=in.($inList)&limit=1000&offset=$offset" -Headers $supabaseHeaders
       foreach ($i in $itemResponse) { $itemIdMap[$i.toast_selection_guid] = $i.id }
       $offset += 1000
     } while ($itemResponse.Count -eq 1000)
