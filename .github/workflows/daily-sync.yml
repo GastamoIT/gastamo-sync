@@ -1,0 +1,34 @@
+name: Gastamo Daily Sync
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # 6:00 AM Mountain Time (UTC-6 MDT / UTC-7 MST)
+  workflow_dispatch:        # allows manual trigger from GitHub UI
+
+jobs:
+  daily-sync:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run daily sync
+        shell: pwsh
+        env:
+          TOAST_CLIENT_ID:     ${{ secrets.TOAST_CLIENT_ID }}
+          TOAST_CLIENT_SECRET: ${{ secrets.TOAST_CLIENT_SECRET }}
+          TOAST_API_URL:       ${{ secrets.TOAST_API_URL }}
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ./scripts/gastamo-daily-sync.ps1
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-sync-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
