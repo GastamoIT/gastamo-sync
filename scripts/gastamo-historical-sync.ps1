@@ -130,6 +130,38 @@ function Get-NextPageUrl($linkHeader) {
   return $null
 }
 
+function Invoke-WithRetry {
+  param(
+    [scriptblock]$ScriptBlock,
+    [int]$MaxRetries = 3,
+    [int]$BaseDelaySeconds = 5,
+    [string]$Label = "API call"
+  )
+  for ($attempt = 1; $attempt -le ($MaxRetries + 1); $attempt++) {
+    try {
+      return (& $ScriptBlock)
+    } catch {
+      $statusCode = $null
+      if ($_.Exception.Response) {
+        $statusCode = [int]$_.Exception.Response.StatusCode
+      }
+      # Only retry on 500, 502, 503, 504, 429
+      $retryable = $statusCode -in @(500, 502, 503, 504, 429)
+      if (-not $retryable -or $attempt -gt $MaxRetries) {
+        throw $_
+      }
+      $delay = $BaseDelaySeconds * [Math]::Pow(2, ($attempt - 1))
+      # Respect Retry-After header on 429
+      if ($statusCode -eq 429 -and $_.Exception.Response.Headers["Retry-After"]) {
+        $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"]
+        if ($retryAfter -gt 0) { $delay = $retryAfter }
+      }
+      Write-Log "  RETRY $attempt/$MaxRetries for $Label (HTTP $statusCode) — waiting ${delay}s" Yellow
+      Start-Sleep -Seconds $delay
+    }
+  }
+}
+
 function Write-ToSupabase($batch, $table, $conflict) {
   if ($batch.Count -eq 0) { return 0 }
   $written = 0
@@ -267,9 +299,11 @@ foreach ($processDate in $datesToProcess) {
       $allOrders = @()
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
       do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
+        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
+          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+            Authorization                  = "Bearer $token"
+            "Toast-Restaurant-External-ID" = $loc.guid
+          }
         }
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
@@ -349,9 +383,11 @@ foreach ($processDate in $datesToProcess) {
       $allOrders = @()
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
       do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
+        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
+          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+            Authorization                  = "Bearer $token"
+            "Toast-Restaurant-External-ID" = $loc.guid
+          }
         }
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
@@ -427,9 +463,11 @@ foreach ($processDate in $datesToProcess) {
       $allOrders = @()
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
       do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
+        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
+          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+            Authorization                  = "Bearer $token"
+            "Toast-Restaurant-External-ID" = $loc.guid
+          }
         }
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
@@ -493,9 +531,11 @@ foreach ($processDate in $datesToProcess) {
       $allOrders = @()
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
       do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
+        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
+          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+            Authorization                  = "Bearer $token"
+            "Toast-Restaurant-External-ID" = $loc.guid
+          }
         }
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
@@ -570,9 +610,11 @@ foreach ($processDate in $datesToProcess) {
       $allOrders = @()
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
       do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
+        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
+          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+            Authorization                  = "Bearer $token"
+            "Toast-Restaurant-External-ID" = $loc.guid
+          }
         }
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
@@ -651,9 +693,11 @@ foreach ($processDate in $datesToProcess) {
       $allOrders = @()
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
       do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
+        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
+          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+            Authorization                  = "Bearer $token"
+            "Toast-Restaurant-External-ID" = $loc.guid
+          }
         }
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
@@ -725,9 +769,11 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $shifts = Invoke-RestMethod -Uri "$toastApiUrl/labor/v1/shifts?startDate=$startUtc&endDate=$endUtc" -Headers @{
-        Authorization                  = "Bearer $token"
-        "Toast-Restaurant-External-ID" = $loc.guid
+      $shifts = Invoke-WithRetry -Label "$($loc.name) shifts" -ScriptBlock {
+        Invoke-RestMethod -Uri "$toastApiUrl/labor/v1/shifts?startDate=$startUtc&endDate=$endUtc" -Headers @{
+          Authorization                  = "Bearer $token"
+          "Toast-Restaurant-External-ID" = $loc.guid
+        }
       }
       $batch = @()
       foreach ($shift in $shifts) {
@@ -766,9 +812,11 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $entries = Invoke-RestMethod -Uri "$toastApiUrl/labor/v1/timeEntries?businessDate=$businessDate" -Headers @{
-        Authorization                  = "Bearer $token"
-        "Toast-Restaurant-External-ID" = $loc.guid
+      $entries = Invoke-WithRetry -Label "$($loc.name) timeEntries" -ScriptBlock {
+        Invoke-RestMethod -Uri "$toastApiUrl/labor/v1/timeEntries?businessDate=$businessDate" -Headers @{
+          Authorization                  = "Bearer $token"
+          "Toast-Restaurant-External-ID" = $loc.guid
+        }
       }
       $batch = @()
       foreach ($entry in $entries) {
@@ -825,9 +873,11 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $entries = Invoke-RestMethod -Uri "$toastApiUrl/cashmgmt/v1/entries?businessDate=$businessDate" -Headers @{
-        Authorization                  = "Bearer $token"
-        "Toast-Restaurant-External-ID" = $loc.guid
+      $entries = Invoke-WithRetry -Label "$($loc.name) cashEntries" -ScriptBlock {
+        Invoke-RestMethod -Uri "$toastApiUrl/cashmgmt/v1/entries?businessDate=$businessDate" -Headers @{
+          Authorization                  = "Bearer $token"
+          "Toast-Restaurant-External-ID" = $loc.guid
+        }
       }
       $entryBatch = @()
       foreach ($entry in $entries) {
@@ -851,9 +901,11 @@ foreach ($processDate in $datesToProcess) {
       $writtenE = Write-ToSupabase $entryBatch "cash_entries" "location_id,toast_cash_entry_guid"
       $dayCashEntryTotal += $writtenE
 
-      $deposits = Invoke-RestMethod -Uri "$toastApiUrl/cashmgmt/v1/deposits?businessDate=$businessDate" -Headers @{
-        Authorization                  = "Bearer $token"
-        "Toast-Restaurant-External-ID" = $loc.guid
+      $deposits = Invoke-WithRetry -Label "$($loc.name) deposits" -ScriptBlock {
+        Invoke-RestMethod -Uri "$toastApiUrl/cashmgmt/v1/deposits?businessDate=$businessDate" -Headers @{
+          Authorization                  = "Bearer $token"
+          "Toast-Restaurant-External-ID" = $loc.guid
+        }
       }
       $depositBatch = @()
       foreach ($deposit in $deposits) {
