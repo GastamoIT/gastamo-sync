@@ -172,25 +172,58 @@ function Invoke-WithRetry {
   }
 }
 
-function Write-ToSupabase($batch, $table, $conflict) {
-  if ($batch.Count -eq 0) { return 0 }
-  $written = 0
-  for ($j = 0; $j -lt $batch.Count; $j += 25) {
-    $slice = $batch[$j..([Math]::Min($j+24, $batch.Count-1))]
-    $json = $slice | ConvertTo-Json -Depth 5
-    if ($slice.Count -eq 1) { $json = "[$json]" }
-    $url = "$supabaseUrl/rest/v1/$table"
-    if ($conflict) { $url += "?on_conflict=$conflict" }
+function Write-ToSupabase {
+  param(
+    [Parameter(Mandatory = $true)]$batch,
+    [Parameter(Mandatory = $true)][string]$table,
+    [string]$conflict = $null,
+    [string]$select = $null,
+    [int]$batchSize = 100
+  )
 
-    $success = $false
+  $rows = @($batch)
+  if ($rows.Count -eq 0) {
+    if ($select) { return @() }
+    return 0
+  }
+
+  $written = 0
+  $returnedRows = @()
+
+  for ($j = 0; $j -lt $rows.Count; $j += $batchSize) {
+    $end = [Math]::Min($j + $batchSize - 1, $rows.Count - 1)
+    $slice = @($rows[$j..$end])
+    $json = $slice | ConvertTo-Json -Depth 8 -Compress
+    if ($slice.Count -eq 1) { $json = "[$json]" }
+
+    $queryParams = @()
+    if ($conflict) { $queryParams += "on_conflict=$([Uri]::EscapeDataString($conflict))" }
+    if ($select)   { $queryParams += "select=$([Uri]::EscapeDataString($select))" }
+
+    $url = "$supabaseUrl/rest/v1/$table"
+    if ($queryParams.Count -gt 0) {
+      $url += "?" + ($queryParams -join "&")
+    }
+
+    $headers = @{}
+    foreach ($key in $supabaseHeaders.Keys) {
+      $headers[$key] = $supabaseHeaders[$key]
+    }
+    if ($select) {
+      $headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    } else {
+      $headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
+    }
+
     for ($retry = 0; $retry -lt 3; $retry++) {
       try {
-        Invoke-RestMethod -Uri $url -Method POST -Headers $supabaseHeaders -Body $json | Out-Null
+        $response = Invoke-RestMethod -Uri $url -Method POST -Headers $headers -Body $json
         $written += $slice.Count
-        $success = $true
+        if ($select -and $null -ne $response) {
+          $returnedRows += @($response)
+        }
         break
       } catch {
-        # Extract error body (PS7-compatible)
         $errorBody = ""
         try {
           if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
@@ -203,14 +236,13 @@ function Write-ToSupabase($batch, $table, $conflict) {
           }
         } catch {}
 
-        # Retry on statement timeout (57014) or 500/503
         $isTimeout = $errorBody -match "57014" -or $errorBody -match "statement timeout"
         $statusCode = $null
         if ($null -ne $_.Exception.StatusCode) { $statusCode = [int]$_.Exception.StatusCode }
         elseif ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $statusCode = [int]$_.Exception.Response.StatusCode }
         elseif ($_.Exception.Message -match '\b(\d{3})\b') { $statusCode = [int]$matches[1] }
 
-        if (($isTimeout -or $statusCode -in @(500,503)) -and $retry -lt 2) {
+        if (($isTimeout -or $statusCode -in @(500, 503)) -and $retry -lt 2) {
           $delay = 5 * [Math]::Pow(2, $retry)
           Write-Log "  SUPABASE RETRY $($retry+1)/3 on $table (timeout) — waiting ${delay}s" Yellow
           Start-Sleep -Seconds $delay
@@ -221,6 +253,8 @@ function Write-ToSupabase($batch, $table, $conflict) {
       }
     }
   }
+
+  if ($select) { return $returnedRows }
   return $written
 }
 
@@ -302,6 +336,80 @@ function Get-AllSelections($selections, $checkId, $orderId, $locationId, $parent
   return $rows
 }
 
+function Get-ToastOrdersForLocation {
+  param(
+    $Location,
+    [string]$StartUtc,
+    [string]$EndUtc
+  )
+
+  $cacheKey = "$($Location.guid)|$StartUtc|$EndUtc"
+  if ($script:ordersCache.ContainsKey($cacheKey)) {
+    return $script:ordersCache[$cacheKey]
+  }
+
+  $allOrders = @()
+  $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$StartUtc&endDate=$EndUtc&pageSize=100"
+  do {
+    $response = Invoke-WithRetry -Label "$($Location.name) ordersBulk" -ScriptBlock {
+      Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
+        Authorization                  = "Bearer $token"
+        "Toast-Restaurant-External-ID" = $Location.guid
+      }
+    }
+    $allOrders += ($response.Content | ConvertFrom-Json)
+    $url = Get-NextPageUrl $response.Headers["link"]
+  } while ($url)
+
+  $script:ordersCache[$cacheKey] = $allOrders
+  return $allOrders
+}
+
+function Get-ItemLevelDiscountRows {
+  param(
+    $Selections,
+    $SupabaseCheckId,
+    $SupabaseOrderId,
+    $LocationId,
+    $ItemIdMap
+  )
+
+  $rows = @()
+  foreach ($sel in @($Selections)) {
+    if (-not $sel.guid) { continue }
+
+    $supabaseItemId = $null
+    if ($ItemIdMap.ContainsKey($sel.guid)) {
+      $supabaseItemId = $ItemIdMap[$sel.guid]
+    }
+
+    foreach ($discount in @($sel.appliedDiscounts)) {
+      if (-not $discount.guid) { continue }
+      $rows += @{
+        toast_discount_guid  = $discount.guid
+        check_id             = $SupabaseCheckId
+        order_item_id        = $supabaseItemId
+        order_id             = $SupabaseOrderId
+        location_id          = $LocationId
+        name                 = if ($discount.name) { $discount.name } else { $null }
+        discount_amount      = if ($null -ne $discount.discountAmount) { $discount.discountAmount } else { $null }
+        discount_guid        = if ($discount.discount.guid) { $discount.discount.guid } else { $null }
+        discount_type        = if ($discount.discountType) { $discount.discountType } else { $null }
+        processing_state     = if ($discount.processingState) { $discount.processingState } else { $null }
+        approver_guid        = if ($discount.approver.guid) { $discount.approver.guid } else { $null }
+        applied_at_level     = "ITEM"
+        updated_at           = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+      }
+    }
+
+    if ($sel.modifiers -and $sel.modifiers.Count -gt 0) {
+      $rows += Get-ItemLevelDiscountRows -Selections $sel.modifiers -SupabaseCheckId $SupabaseCheckId -SupabaseOrderId $SupabaseOrderId -LocationId $LocationId -ItemIdMap $ItemIdMap
+    }
+  }
+
+  return $rows
+}
+
 # ============================================================
 # MAIN DATE LOOP
 # ============================================================
@@ -328,6 +436,11 @@ foreach ($processDate in $datesToProcess) {
   # Refresh token if needed (expires after 60 min)
   Refresh-TokenIfNeeded
 
+  $script:ordersCache = @{}
+  $orderIdMap = @{}
+  $checkIdMap = @{}
+  $itemIdMapsByLocation = @{}
+
   # ============================================================
   # 1. TOAST ORDERS
   # ============================================================
@@ -337,18 +450,7 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
-          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-            Authorization                  = "Bearer $token"
-            "Toast-Restaurant-External-ID" = $loc.guid
-          }
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-ToastOrdersForLocation -Location $loc -StartUtc $startUtc -EndUtc $endUtc
 
       $batch = @()
       foreach ($order in $allOrders) {
@@ -394,12 +496,18 @@ foreach ($processDate in $datesToProcess) {
           updated_at                 = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
         }
       }
-      $written = Write-ToSupabase $batch "toast_orders" "location_id,toast_order_guid"
-      $dayOrderTotal += $written
+
+      $writtenRows = @(Write-ToSupabase -batch $batch -table "toast_orders" -conflict "location_id,toast_order_guid" -select "id,toast_order_guid" -batchSize 100)
+      foreach ($row in $writtenRows) {
+        if ($row.toast_order_guid) {
+          $orderIdMap[$row.toast_order_guid] = $row.id
+        }
+      }
+      $dayOrderTotal += $writtenRows.Count
     } catch {
       Write-Log "  ERROR $($loc.name) orders: $(Get-ToastErrorDetail $_)" Red
     }
-    Start-Sleep -Milliseconds 500
+    Start-Sleep -Milliseconds 100
   }
   Write-Log "  Orders: $dayOrderTotal" Green
   $grandTotalOrders += $dayOrderTotal
@@ -408,38 +516,18 @@ foreach ($processDate in $datesToProcess) {
   # 2. TOAST CHECKS
   # ============================================================
   Write-Log "--- Checks ---" Cyan
-  $orderIdMap = @{}
-  $offset = 0
-  do {
-    $orderResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_orders?select=id,toast_order_guid&business_date=eq.$businessDate&limit=1000&offset=$offset" -Headers $supabaseHeaders
-    foreach ($o in $orderResponse) { $orderIdMap[$o.toast_order_guid] = $o.id }
-    $offset += 1000
-  } while ($orderResponse.Count -eq 1000)
-
   $dayCheckTotal = 0
   foreach ($loc in $locations) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
-          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-            Authorization                  = "Bearer $token"
-            "Toast-Restaurant-External-ID" = $loc.guid
-          }
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
-
+      $allOrders = Get-ToastOrdersForLocation -Location $loc -StartUtc $startUtc -EndUtc $endUtc
       $batch = @()
       foreach ($order in $allOrders) {
         if (-not $order.guid) { continue }
         $supabaseOrderId = $orderIdMap[$order.guid]
         if (-not $supabaseOrderId) { continue }
-        foreach ($check in $order.checks) {
+        foreach ($check in @($order.checks)) {
           if (-not $check.guid) { continue }
           $batch += @{
             toast_check_guid        = $check.guid
@@ -474,12 +562,17 @@ foreach ($processDate in $datesToProcess) {
           }
         }
       }
-      $written = Write-ToSupabase $batch "toast_checks" "toast_check_guid"
-      $dayCheckTotal += $written
+
+      $writtenRows = @(Write-ToSupabase -batch $batch -table "toast_checks" -conflict "toast_check_guid" -select "id,toast_check_guid" -batchSize 100)
+      foreach ($row in $writtenRows) {
+        if ($row.toast_check_guid) {
+          $checkIdMap[$row.toast_check_guid] = $row.id
+        }
+      }
+      $dayCheckTotal += $writtenRows.Count
     } catch {
       Write-Log "  ERROR $($loc.name) checks: $(Get-ToastErrorDetail $_)" Red
     }
-    Start-Sleep -Milliseconds 500
   }
   Write-Log "  Checks: $dayCheckTotal" Green
   $grandTotalChecks += $dayCheckTotal
@@ -488,38 +581,18 @@ foreach ($processDate in $datesToProcess) {
   # 3. TOAST ORDER ITEMS
   # ============================================================
   Write-Log "--- Order Items ---" Cyan
-  $checkIdMap = @{}
-  $offset = 0
-  do {
-    $checkResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_checks?select=id,toast_check_guid&limit=1000&offset=$offset" -Headers $supabaseHeaders
-    foreach ($c in $checkResponse) { $checkIdMap[$c.toast_check_guid] = $c.id }
-    $offset += 1000
-  } while ($checkResponse.Count -eq 1000)
-
   $dayItemTotal = 0
   foreach ($loc in $locations) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
-          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-            Authorization                  = "Bearer $token"
-            "Toast-Restaurant-External-ID" = $loc.guid
-          }
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
-
+      $allOrders = Get-ToastOrdersForLocation -Location $loc -StartUtc $startUtc -EndUtc $endUtc
       $allSelections = @()
       foreach ($order in $allOrders) {
         if (-not $order.guid) { continue }
         $supabaseOrderId = $orderIdMap[$order.guid]
         if (-not $supabaseOrderId) { continue }
-        foreach ($check in $order.checks) {
+        foreach ($check in @($order.checks)) {
           if (-not $check.guid) { continue }
           $supabaseCheckId = $checkIdMap[$check.guid]
           if (-not $supabaseCheckId) { continue }
@@ -529,33 +602,42 @@ foreach ($processDate in $datesToProcess) {
         }
       }
 
-      $topLevel  = @($allSelections | Where-Object { $null -eq $_['_parent_toast_guid'] })
-      $modifiers = @($allSelections | Where-Object { $null -ne $_['_parent_toast_guid'] })
+      $pending = @($allSelections)
+      $locationItemIdMap = @{}
+      while ($pending.Count -gt 0) {
+        $insertable = @()
+        $remaining = @()
 
-      $topLevelClean = Strip-HelperFields $topLevel
-      Write-ToSupabase $topLevelClean "toast_order_items" "toast_selection_guid" | Out-Null
+        foreach ($row in $pending) {
+          if ($null -eq $row['_parent_toast_guid']) {
+            $insertable += Strip-HelperFields @($row)
+          } elseif ($locationItemIdMap.ContainsKey($row['_parent_toast_guid'])) {
+            $row['parent_item_id'] = $locationItemIdMap[$row['_parent_toast_guid']]
+            $insertable += Strip-HelperFields @($row)
+          } else {
+            $remaining += $row
+          }
+        }
 
-      $itemIdMap2 = @{}
-      $offset2 = 0
-      do {
-        $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&location_id=eq.$locationId&limit=1000&offset=$offset2" -Headers $supabaseHeaders
-        foreach ($item in $itemResponse) { $itemIdMap2[$item.toast_selection_guid] = $item.id }
-        $offset2 += 1000
-      } while ($itemResponse.Count -eq 1000)
+        if ($insertable.Count -eq 0) {
+          Write-Log "  WARNING $($loc.name) items: unable to resolve $($remaining.Count) modifier parent ids" Yellow
+          break
+        }
 
-      $resolvedModifiers = $modifiers | ForEach-Object {
-        $_['parent_item_id'] = $itemIdMap2[$_['_parent_toast_guid']]
-        $_
+        $insertedRows = @(Write-ToSupabase -batch $insertable -table "toast_order_items" -conflict "toast_selection_guid" -select "id,toast_selection_guid" -batchSize 50)
+        foreach ($row in $insertedRows) {
+          if ($row.toast_selection_guid) {
+            $locationItemIdMap[$row.toast_selection_guid] = $row.id
+          }
+        }
+        $dayItemTotal += $insertedRows.Count
+        $pending = @($remaining)
       }
-      $resolvedClean = Strip-HelperFields $resolvedModifiers
-      Write-ToSupabase $resolvedClean "toast_order_items" "toast_selection_guid" | Out-Null
 
-      $locTotal = $topLevel.Count + $resolvedModifiers.Count
-      $dayItemTotal += $locTotal
+      $itemIdMapsByLocation[$loc.guid] = $locationItemIdMap
     } catch {
       Write-Log "  ERROR $($loc.name) items: $(Get-ToastErrorDetail $_)" Red
     }
-    Start-Sleep -Milliseconds 500
   }
   Write-Log "  Items: $dayItemTotal" Green
   $grandTotalItems += $dayItemTotal
@@ -569,29 +651,17 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
-          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-            Authorization                  = "Bearer $token"
-            "Toast-Restaurant-External-ID" = $loc.guid
-          }
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
-
+      $allOrders = Get-ToastOrdersForLocation -Location $loc -StartUtc $startUtc -EndUtc $endUtc
       $batch = @()
       foreach ($order in $allOrders) {
         if (-not $order.guid) { continue }
         $supabaseOrderId = $orderIdMap[$order.guid]
         if (-not $supabaseOrderId) { continue }
-        foreach ($check in $order.checks) {
+        foreach ($check in @($order.checks)) {
           if (-not $check.guid) { continue }
           $supabaseCheckId = $checkIdMap[$check.guid]
           if (-not $supabaseCheckId) { continue }
-          foreach ($payment in $check.payments) {
+          foreach ($payment in @($check.payments)) {
             if (-not $payment.guid) { continue }
             $batch += @{
               toast_payment_guid      = $payment.guid
@@ -621,12 +691,11 @@ foreach ($processDate in $datesToProcess) {
           }
         }
       }
-      $written = Write-ToSupabase $batch "toast_payments" "toast_payment_guid"
+      $written = Write-ToSupabase -batch $batch -table "toast_payments" -conflict "toast_payment_guid" -batchSize 100
       $dayPaymentTotal += $written
     } catch {
       Write-Log "  ERROR $($loc.name) payments: $(Get-ToastErrorDetail $_)" Red
     }
-    Start-Sleep -Milliseconds 500
   }
   Write-Log "  Payments: $dayPaymentTotal" Green
   $grandTotalPayments += $dayPaymentTotal
@@ -635,42 +704,28 @@ foreach ($processDate in $datesToProcess) {
   # 5. TOAST DISCOUNTS
   # ============================================================
   Write-Log "--- Discounts ---" Cyan
-  $itemIdMap = @{}
-  $offset = 0
-  do {
-    $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&limit=1000&offset=$offset" -Headers $supabaseHeaders
-    foreach ($i in $itemResponse) { $itemIdMap[$i.toast_selection_guid] = $i.id }
-    $offset += 1000
-  } while ($itemResponse.Count -eq 1000)
-
   $dayDiscountTotal = 0
   foreach ($loc in $locations) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
-          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-            Authorization                  = "Bearer $token"
-            "Toast-Restaurant-External-ID" = $loc.guid
-          }
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-ToastOrdersForLocation -Location $loc -StartUtc $startUtc -EndUtc $endUtc
+      $itemIdMap = @{}
+      if ($itemIdMapsByLocation.ContainsKey($loc.guid)) {
+        $itemIdMap = $itemIdMapsByLocation[$loc.guid]
+      }
 
       $batch = @()
       foreach ($order in $allOrders) {
         if (-not $order.guid) { continue }
         $supabaseOrderId = $orderIdMap[$order.guid]
         if (-not $supabaseOrderId) { continue }
-        foreach ($check in $order.checks) {
+        foreach ($check in @($order.checks)) {
           if (-not $check.guid) { continue }
           $supabaseCheckId = $checkIdMap[$check.guid]
           if (-not $supabaseCheckId) { continue }
-          foreach ($discount in $check.appliedDiscounts) {
+
+          foreach ($discount in @($check.appliedDiscounts)) {
             if (-not $discount.guid) { continue }
             $batch += @{
               toast_discount_guid  = $discount.guid
@@ -688,36 +743,18 @@ foreach ($processDate in $datesToProcess) {
               updated_at           = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
             }
           }
-          foreach ($sel in $check.selections) {
-            if (-not $sel.guid) { continue }
-            $supabaseItemId = $itemIdMap[$sel.guid]
-            foreach ($discount in $sel.appliedDiscounts) {
-              if (-not $discount.guid) { continue }
-              $batch += @{
-                toast_discount_guid  = $discount.guid
-                check_id             = $supabaseCheckId
-                order_item_id        = $supabaseItemId
-                order_id             = $supabaseOrderId
-                location_id          = $locationId
-                name                 = if ($discount.name) { $discount.name } else { $null }
-                discount_amount      = if ($null -ne $discount.discountAmount) { $discount.discountAmount } else { $null }
-                discount_guid        = if ($discount.discount.guid) { $discount.discount.guid } else { $null }
-                discount_type        = if ($discount.discountType) { $discount.discountType } else { $null }
-                processing_state     = if ($discount.processingState) { $discount.processingState } else { $null }
-                approver_guid        = if ($discount.approver.guid) { $discount.approver.guid } else { $null }
-                applied_at_level     = "ITEM"
-                updated_at           = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
-              }
-            }
+
+          if ($check.selections -and $check.selections.Count -gt 0) {
+            $batch += Get-ItemLevelDiscountRows -Selections $check.selections -SupabaseCheckId $supabaseCheckId -SupabaseOrderId $supabaseOrderId -LocationId $locationId -ItemIdMap $itemIdMap
           }
         }
       }
-      $written = Write-ToSupabase $batch "toast_discounts" "toast_discount_guid"
+
+      $written = Write-ToSupabase -batch $batch -table "toast_discounts" -conflict "toast_discount_guid" -batchSize 100
       $dayDiscountTotal += $written
     } catch {
       Write-Log "  ERROR $($loc.name) discounts: $(Get-ToastErrorDetail $_)" Red
     }
-    Start-Sleep -Milliseconds 500
   }
   Write-Log "  Discounts: $dayDiscountTotal" Green
   $grandTotalDiscounts += $dayDiscountTotal
@@ -731,29 +768,17 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WithRetry -Label "$($loc.name)" -ScriptBlock {
-          Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-            Authorization                  = "Bearer $token"
-            "Toast-Restaurant-External-ID" = $loc.guid
-          }
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
-
+      $allOrders = Get-ToastOrdersForLocation -Location $loc -StartUtc $startUtc -EndUtc $endUtc
       $batch = @()
       foreach ($order in $allOrders) {
         if (-not $order.guid) { continue }
         $supabaseOrderId = $orderIdMap[$order.guid]
         if (-not $supabaseOrderId) { continue }
-        foreach ($check in $order.checks) {
+        foreach ($check in @($order.checks)) {
           if (-not $check.guid) { continue }
           $supabaseCheckId = $checkIdMap[$check.guid]
           if (-not $supabaseCheckId) { continue }
-          foreach ($sc in $check.appliedServiceCharges) {
+          foreach ($sc in @($check.appliedServiceCharges)) {
             if (-not $sc.guid) { continue }
             $batch += @{
               toast_service_charge_guid  = $sc.guid
@@ -775,12 +800,11 @@ foreach ($processDate in $datesToProcess) {
           }
         }
       }
-      $written = Write-ToSupabase $batch "toast_service_charges" "toast_service_charge_guid"
+      $written = Write-ToSupabase -batch $batch -table "toast_service_charges" -conflict "toast_service_charge_guid" -batchSize 100
       $daySvcChargeTotal += $written
     } catch {
       Write-Log "  ERROR $($loc.name) service charges: $(Get-ToastErrorDetail $_)" Red
     }
-    Start-Sleep -Milliseconds 500
   }
   Write-Log "  Service Charges: $daySvcChargeTotal" Green
   $grandTotalSvcCharges += $daySvcChargeTotal
