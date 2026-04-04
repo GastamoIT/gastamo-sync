@@ -68,7 +68,7 @@ try {
   $tokenAcquiredAt = Get-Date
   Write-Log "Toast token acquired (length=$($token.Length))" Green
 } catch {
-  Write-Log "FATAL: Toast auth failed — $(Get-ToastErrorDetail $_.Exception)" Red
+  Write-Log "FATAL: Toast auth failed — $(Get-ToastErrorDetail $_)" Red
   exit 1
 }
 
@@ -108,18 +108,24 @@ foreach ($loc in $locResponse) { $locationIdMap[$loc.toast_restaurant_guid] = $l
 # ============================================================
 # HELPERS
 # ============================================================
-function Get-ToastErrorDetail($exception) {
+function Get-ToastErrorDetail($errorRecord) {
   # Extract the response body from Toast 4xx/5xx errors
+  # Works across PowerShell 5.1 and 7
   try {
-    if ($exception.Response) {
-      $reader = New-Object System.IO.StreamReader($exception.Response.GetResponseStream())
+    # PS7: ErrorDetails.Message often contains the response body
+    if ($errorRecord.ErrorDetails -and $errorRecord.ErrorDetails.Message) {
+      return "$($errorRecord.Exception.Message) | Body: $($errorRecord.ErrorDetails.Message)"
+    }
+    # PS5.1: WebException has Response.GetResponseStream()
+    if ($errorRecord.Exception.Response -and $errorRecord.Exception.Response.GetResponseStream) {
+      $reader = New-Object System.IO.StreamReader($errorRecord.Exception.Response.GetResponseStream())
       $reader.BaseStream.Position = 0
       $body = $reader.ReadToEnd()
       $reader.Close()
-      return "$($exception.Message) | Body: $body"
+      return "$($errorRecord.Exception.Message) | Body: $body"
     }
   } catch {}
-  return $exception.Message
+  return $errorRecord.Exception.Message
 }
 
 function Get-NextPageUrl($linkHeader) {
@@ -142,8 +148,17 @@ function Invoke-WithRetry {
       return (& $ScriptBlock)
     } catch {
       $statusCode = $null
-      if ($_.Exception.Response) {
+      # PS7: HttpRequestException has .StatusCode directly
+      if ($null -ne $_.Exception.StatusCode) {
+        $statusCode = [int]$_.Exception.StatusCode
+      }
+      # PS5.1: WebException has .Response.StatusCode
+      elseif ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
         $statusCode = [int]$_.Exception.Response.StatusCode
+      }
+      # Fallback: parse 3-digit code from error message
+      elseif ($_.Exception.Message -match '\b(\d{3})\b') {
+        $statusCode = [int]$matches[1]
       }
       # Only retry on 500, 502, 503, 504, 429
       $retryable = $statusCode -in @(500, 502, 503, 504, 429)
@@ -151,11 +166,6 @@ function Invoke-WithRetry {
         throw $_
       }
       $delay = $BaseDelaySeconds * [Math]::Pow(2, ($attempt - 1))
-      # Respect Retry-After header on 429
-      if ($statusCode -eq 429 -and $_.Exception.Response.Headers["Retry-After"]) {
-        $retryAfter = [int]$_.Exception.Response.Headers["Retry-After"]
-        if ($retryAfter -gt 0) { $delay = $retryAfter }
-      }
       Write-Log "  RETRY $attempt/$MaxRetries for $Label (HTTP $statusCode) — waiting ${delay}s" Yellow
       Start-Sleep -Seconds $delay
     }
@@ -210,7 +220,7 @@ function Refresh-TokenIfNeeded {
       $script:tokenAcquiredAt = Get-Date
       Write-Log "Toast token refreshed (length=$($newToken.Length))" Green
     } catch {
-      Write-Log "WARNING: Token refresh failed — $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "WARNING: Token refresh failed — $(Get-ToastErrorDetail $_)" Red
     }
   }
 }
@@ -356,7 +366,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_orders" "location_id,toast_order_guid"
       $dayOrderTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) orders: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) orders: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -436,7 +446,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_checks" "toast_check_guid"
       $dayCheckTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) checks: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) checks: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -512,7 +522,7 @@ foreach ($processDate in $datesToProcess) {
       $locTotal = $topLevel.Count + $resolvedModifiers.Count
       $dayItemTotal += $locTotal
     } catch {
-      Write-Log "  ERROR $($loc.name) items: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) items: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -583,7 +593,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_payments" "toast_payment_guid"
       $dayPaymentTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) payments: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) payments: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -674,7 +684,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_discounts" "toast_discount_guid"
       $dayDiscountTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) discounts: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) discounts: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -737,7 +747,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_service_charges" "toast_service_charge_guid"
       $daySvcChargeTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) service charges: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) service charges: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -796,7 +806,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_shifts" "location_id,toast_shift_guid"
       $dayShiftTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) shifts: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) shifts: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -856,7 +866,7 @@ foreach ($processDate in $datesToProcess) {
       $written = Write-ToSupabase $batch "toast_time_entries" "location_id,toast_time_entry_guid"
       $dayTimeEntryTotal += $written
     } catch {
-      Write-Log "  ERROR $($loc.name) time entries: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) time entries: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
@@ -924,7 +934,7 @@ foreach ($processDate in $datesToProcess) {
       $writtenD = Write-ToSupabase $depositBatch "cash_deposits" "location_id,toast_deposit_guid"
       $dayDepositTotal += $writtenD
     } catch {
-      Write-Log "  ERROR $($loc.name) cash: $(Get-ToastErrorDetail $_.Exception)" Red
+      Write-Log "  ERROR $($loc.name) cash: $(Get-ToastErrorDetail $_)" Red
     }
     Start-Sleep -Milliseconds 500
   }
