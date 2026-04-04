@@ -24,7 +24,6 @@ jobs:
           SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
         run: |
           ./scripts/gastamo-daily-sync.ps1
-          ./scripts/gastamo-weekly-sync.ps1
 
       - name: Upload log
         if: always()
