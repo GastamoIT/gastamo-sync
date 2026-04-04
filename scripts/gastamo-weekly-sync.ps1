@@ -48,11 +48,8 @@ try {
     userAccessType = 'TOAST_MACHINE_CLIENT'
   } | ConvertTo-Json
 
-  $authResponse = Invoke-RestMethod \
-    -Uri "$toastApiUrl/authentication/v1/authentication/login" \
-    -Method POST \
-    -Body $authBody \
-    -ContentType 'application/json'
+  $authUri = '{0}/authentication/v1/authentication/login' -f $toastApiUrl.TrimEnd('/')
+  $authResponse = Invoke-RestMethod -Uri $authUri -Method POST -Body $authBody -ContentType 'application/json'
 
   $token = $authResponse.token.accessToken
   Write-Log ("Toast token acquired (length={0})" -f $token.Length) 'Green'
