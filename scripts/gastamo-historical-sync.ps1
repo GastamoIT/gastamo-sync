@@ -175,19 +175,50 @@ function Invoke-WithRetry {
 function Write-ToSupabase($batch, $table, $conflict) {
   if ($batch.Count -eq 0) { return 0 }
   $written = 0
-  for ($j = 0; $j -lt $batch.Count; $j += 50) {
-    $slice = $batch[$j..([Math]::Min($j+49, $batch.Count-1))]
+  for ($j = 0; $j -lt $batch.Count; $j += 25) {
+    $slice = $batch[$j..([Math]::Min($j+24, $batch.Count-1))]
     $json = $slice | ConvertTo-Json -Depth 5
     if ($slice.Count -eq 1) { $json = "[$json]" }
     $url = "$supabaseUrl/rest/v1/$table"
     if ($conflict) { $url += "?on_conflict=$conflict" }
-    try {
-      Invoke-RestMethod -Uri $url -Method POST -Headers $supabaseHeaders -Body $json | Out-Null
-      $written += $slice.Count
-    } catch {
-      $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-      $reader.BaseStream.Position = 0
-      Write-Log "  SUPABASE ERROR on $table : $($reader.ReadToEnd())" Red
+
+    $success = $false
+    for ($retry = 0; $retry -lt 3; $retry++) {
+      try {
+        Invoke-RestMethod -Uri $url -Method POST -Headers $supabaseHeaders -Body $json | Out-Null
+        $written += $slice.Count
+        $success = $true
+        break
+      } catch {
+        # Extract error body (PS7-compatible)
+        $errorBody = ""
+        try {
+          if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $errorBody = $_.ErrorDetails.Message
+          } elseif ($_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+            $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+            $reader.BaseStream.Position = 0
+            $errorBody = $reader.ReadToEnd()
+            $reader.Close()
+          }
+        } catch {}
+
+        # Retry on statement timeout (57014) or 500/503
+        $isTimeout = $errorBody -match "57014" -or $errorBody -match "statement timeout"
+        $statusCode = $null
+        if ($null -ne $_.Exception.StatusCode) { $statusCode = [int]$_.Exception.StatusCode }
+        elseif ($_.Exception.Response -and $_.Exception.Response.StatusCode) { $statusCode = [int]$_.Exception.Response.StatusCode }
+        elseif ($_.Exception.Message -match '\b(\d{3})\b') { $statusCode = [int]$matches[1] }
+
+        if (($isTimeout -or $statusCode -in @(500,503)) -and $retry -lt 2) {
+          $delay = 5 * [Math]::Pow(2, $retry)
+          Write-Log "  SUPABASE RETRY $($retry+1)/3 on $table (timeout) — waiting ${delay}s" Yellow
+          Start-Sleep -Seconds $delay
+        } else {
+          Write-Log "  SUPABASE ERROR on $table : $($_.Exception.Message) | $errorBody" Red
+          break
+        }
+      }
     }
   }
   return $written
@@ -380,7 +411,7 @@ foreach ($processDate in $datesToProcess) {
   $orderIdMap = @{}
   $offset = 0
   do {
-    $orderResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_orders?select=id,toast_order_guid&limit=1000&offset=$offset" -Headers $supabaseHeaders
+    $orderResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_orders?select=id,toast_order_guid&business_date=eq.$businessDate&limit=1000&offset=$offset" -Headers $supabaseHeaders
     foreach ($o in $orderResponse) { $orderIdMap[$o.toast_order_guid] = $o.id }
     $offset += 1000
   } while ($orderResponse.Count -eq 1000)
@@ -507,7 +538,7 @@ foreach ($processDate in $datesToProcess) {
       $itemIdMap2 = @{}
       $offset2 = 0
       do {
-        $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&limit=1000&offset=$offset2" -Headers $supabaseHeaders
+        $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&location_id=eq.$locationId&limit=1000&offset=$offset2" -Headers $supabaseHeaders
         foreach ($item in $itemResponse) { $itemIdMap2[$item.toast_selection_guid] = $item.id }
         $offset2 += 1000
       } while ($itemResponse.Count -eq 1000)
