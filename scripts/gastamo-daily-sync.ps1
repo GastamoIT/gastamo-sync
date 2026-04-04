@@ -257,7 +257,7 @@ function Write-ToSupabase {
           Write-Log "  SUPABASE RETRY $($retry+1)/3 on $table (timeout) — waiting ${delay}s" Yellow
           Start-Sleep -Seconds $delay
         } else {
-          throw "Supabase write failed on $table: $($_.Exception.Message) | $errorBody"
+          throw ("Supabase write failed on {0}: {1}" -f $table, $_.Exception.Message) $($_.Exception.Message) | $errorBody"
         }
       }
     }
