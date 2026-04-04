@@ -1,0 +1,4 @@
+@'
+logs/*.log
+*.log
+'@ | Out-File -FilePath .gitignore -Encoding utf8
