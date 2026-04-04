@@ -1,0 +1,34 @@
+name: Gastamo Weekly Config Sync
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'  # 2:00 AM Mountain Time on Sundays (UTC-6 MDT)
+  workflow_dispatch:       # allows manual trigger from GitHub UI
+
+jobs:
+  weekly-sync:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run weekly config sync
+        shell: pwsh
+        env:
+          TOAST_CLIENT_ID:     ${{ secrets.TOAST_CLIENT_ID }}
+          TOAST_CLIENT_SECRET: ${{ secrets.TOAST_CLIENT_SECRET }}
+          TOAST_API_URL:       ${{ secrets.TOAST_API_URL }}
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ./scripts/gastamo-weekly-sync.ps1
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-sync-log-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
