@@ -186,7 +186,13 @@ function Get-OrdersBulkResilient($locGuid, $token, $startUtc, $endUtc, $locName)
     "Toast-Restaurant-External-ID" = $locGuid
   }
 
+  # Helper: safely extract HTTP status code from a caught exception
+  function Get-StatusCode($err) {
+    try { return [int]$err.Exception.Response.StatusCode } catch { return 0 }
+  }
+
   # First try the full window
+  $fullWindowFailed = $false
   try {
     $allOrders = @()
     $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
@@ -197,25 +203,28 @@ function Get-OrdersBulkResilient($locGuid, $token, $startUtc, $endUtc, $locName)
     } while ($url)
     return $allOrders
   } catch {
-    $statusCode = $_.Exception.Response.StatusCode.value__
-    if ($statusCode -ne 500) { throw }
-    Write-Log "  WARN $locName full-day fetch returned 500 — retrying in 4-hour windows" Yellow
+    $sc = Get-StatusCode $_
+    if ($sc -ne 500) { throw }
+    $fullWindowFailed = $true
+    Write-Log "  WARN $locName full-day fetch 500 — retrying in 4-hour windows" Yellow
+    Start-Sleep -Seconds 2
   }
 
-  # Fallback: split the day into 4-hour sub-windows
-  # Decode the escaped dates back to DateTime for arithmetic
-  $startDecoded = [Uri]::UnescapeDataString($startUtc)
-  $endDecoded   = [Uri]::UnescapeDataString($endUtc)
-  $windowStart  = [datetime]::Parse($startDecoded, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
-  $windowEnd    = [datetime]::Parse($endDecoded,   $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+  if (-not $fullWindowFailed) { return @() }
+
+  # Fallback: split into 4-hour sub-windows using the raw DateTime objects already in scope
+  # $startUtc / $endUtc are URL-encoded strings like "2026-03-07T07%3A00%3A00..."
+  # Re-derive from $processDate which is in scope from the caller
+  $windowStart = $processDate.AddHours(7)   # 07:00 UTC = midnight MT
+  $windowEnd   = $processDate.AddDays(1).AddHours(7)
 
   $allOrders = @()
   $chunkStart = $windowStart
   while ($chunkStart -lt $windowEnd) {
     $chunkEnd = $chunkStart.AddHours(4)
     if ($chunkEnd -gt $windowEnd) { $chunkEnd = $windowEnd }
-    $csEsc = [Uri]::EscapeDataString($chunkStart.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz") -replace '\+','%2B')
-    $ceEsc = [Uri]::EscapeDataString($chunkEnd.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")   -replace '\+','%2B')
+    $csEsc = [Uri]::EscapeDataString($chunkStart.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff+0000"))
+    $ceEsc = [Uri]::EscapeDataString($chunkEnd.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff+0000"))
     try {
       $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$csEsc&endDate=$ceEsc&pageSize=100"
       do {
@@ -223,11 +232,13 @@ function Get-OrdersBulkResilient($locGuid, $token, $startUtc, $endUtc, $locName)
         $allOrders += ($response.Content | ConvertFrom-Json)
         $url = Get-NextPageUrl $response.Headers["link"]
       } while ($url)
+      Write-Log "  INFO $locName chunk $($chunkStart.ToString('HH:mm'))-$($chunkEnd.ToString('HH:mm')) OK ($($allOrders.Count) so far)" Cyan
     } catch {
-      Write-Log "  ERROR $locName chunk $($chunkStart.ToString('HH:mm'))-$($chunkEnd.ToString('HH:mm')): $($_.Exception.Message)" Red
+      $sc = Get-StatusCode $_
+      Write-Log "  ERROR $locName chunk $($chunkStart.ToString('HH:mm'))-$($chunkEnd.ToString('HH:mm')) HTTP $sc : $($_.Exception.Message)" Red
     }
     $chunkStart = $chunkEnd
-    Start-Sleep -Milliseconds 300
+    Start-Sleep -Milliseconds 500
   }
   return $allOrders
 }
