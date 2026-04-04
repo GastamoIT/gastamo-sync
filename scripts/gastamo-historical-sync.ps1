@@ -179,6 +179,59 @@ function Build-SelectionRow($sel, $checkId, $orderId, $locationId, $parentToastG
   }
 }
 
+# Fetches all orders for a location+day, retrying with 4-hour sub-windows on 500 errors
+function Get-OrdersBulkResilient($locGuid, $token, $startUtc, $endUtc, $locName) {
+  $headers = @{
+    Authorization                  = "Bearer $token"
+    "Toast-Restaurant-External-ID" = $locGuid
+  }
+
+  # First try the full window
+  try {
+    $allOrders = @()
+    $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
+    do {
+      $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers
+      $allOrders += ($response.Content | ConvertFrom-Json)
+      $url = Get-NextPageUrl $response.Headers["link"]
+    } while ($url)
+    return $allOrders
+  } catch {
+    $statusCode = $_.Exception.Response.StatusCode.value__
+    if ($statusCode -ne 500) { throw }
+    Write-Log "  WARN $locName full-day fetch returned 500 — retrying in 4-hour windows" Yellow
+  }
+
+  # Fallback: split the day into 4-hour sub-windows
+  # Decode the escaped dates back to DateTime for arithmetic
+  $startDecoded = [Uri]::UnescapeDataString($startUtc)
+  $endDecoded   = [Uri]::UnescapeDataString($endUtc)
+  $windowStart  = [datetime]::Parse($startDecoded, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+  $windowEnd    = [datetime]::Parse($endDecoded,   $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+
+  $allOrders = @()
+  $chunkStart = $windowStart
+  while ($chunkStart -lt $windowEnd) {
+    $chunkEnd = $chunkStart.AddHours(4)
+    if ($chunkEnd -gt $windowEnd) { $chunkEnd = $windowEnd }
+    $csEsc = [Uri]::EscapeDataString($chunkStart.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz") -replace '\+','%2B')
+    $ceEsc = [Uri]::EscapeDataString($chunkEnd.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")   -replace '\+','%2B')
+    try {
+      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$csEsc&endDate=$ceEsc&pageSize=100"
+      do {
+        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers $headers
+        $allOrders += ($response.Content | ConvertFrom-Json)
+        $url = Get-NextPageUrl $response.Headers["link"]
+      } while ($url)
+    } catch {
+      Write-Log "  ERROR $locName chunk $($chunkStart.ToString('HH:mm'))-$($chunkEnd.ToString('HH:mm')): $($_.Exception.Message)" Red
+    }
+    $chunkStart = $chunkEnd
+    Start-Sleep -Milliseconds 300
+  }
+  return $allOrders
+}
+
 function Get-AllSelections($selections, $checkId, $orderId, $locationId, $parentToastGuid) {
   $rows = @()
   foreach ($sel in $selections) {
@@ -226,16 +279,7 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-OrdersBulkResilient $loc.guid $token $startUtc $endUtc $loc.name
 
       $batch = @()
       foreach ($order in $allOrders) {
@@ -308,16 +352,7 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-OrdersBulkResilient $loc.guid $token $startUtc $endUtc $loc.name
 
       $batch = @()
       foreach ($order in $allOrders) {
@@ -386,16 +421,7 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-OrdersBulkResilient $loc.guid $token $startUtc $endUtc $loc.name
 
       $allSelections = @()
       foreach ($order in $allOrders) {
@@ -419,12 +445,15 @@ foreach ($processDate in $datesToProcess) {
       Write-ToSupabase $topLevelClean "toast_order_items" "toast_selection_guid" | Out-Null
 
       $itemIdMap2 = @{}
-      $offset2 = 0
-      do {
-        $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&limit=1000&offset=$offset2" -Headers $supabaseHeaders
-        foreach ($item in $itemResponse) { $itemIdMap2[$item.toast_selection_guid] = $item.id }
-        $offset2 += 1000
-      } while ($itemResponse.Count -eq 1000)
+      if ($topLevel.Count -gt 0) {
+        $topLevelOrderIds = ($topLevel | ForEach-Object { $_['order_id'] } | Select-Object -Unique) -join ","
+        $offset2 = 0
+        do {
+          $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&order_id=in.($topLevelOrderIds)&limit=1000&offset=$offset2" -Headers $supabaseHeaders
+          foreach ($item in $itemResponse) { $itemIdMap2[$item.toast_selection_guid] = $item.id }
+          $offset2 += 1000
+        } while ($itemResponse.Count -eq 1000)
+      }
 
       $resolvedModifiers = $modifiers | ForEach-Object {
         $_['parent_item_id'] = $itemIdMap2[$_['_parent_toast_guid']]
@@ -452,16 +481,7 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-OrdersBulkResilient $loc.guid $token $startUtc $endUtc $loc.name
 
       $batch = @()
       foreach ($order in $allOrders) {
@@ -516,29 +536,26 @@ foreach ($processDate in $datesToProcess) {
   # 5. TOAST DISCOUNTS
   # ============================================================
   Write-Log "--- Discounts ---" Cyan
+  # Scope item lookup to this day's order IDs — avoids a full-table scan / Supabase statement timeout
+  # $orderIdMap is already populated above and contains only this day's orders
   $itemIdMap = @{}
-  $offset = 0
-  do {
-    $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&limit=1000&offset=$offset" -Headers $supabaseHeaders
-    foreach ($i in $itemResponse) { $itemIdMap[$i.toast_selection_guid] = $i.id }
-    $offset += 1000
-  } while ($itemResponse.Count -eq 1000)
+  if ($orderIdMap.Count -gt 0) {
+    # Build a comma-separated list of supabase order IDs for this day
+    $dayOrderIds = ($orderIdMap.Values | Select-Object -Unique) -join ","
+    $offset = 0
+    do {
+      $itemResponse = Invoke-RestMethod -Uri "$supabaseUrl/rest/v1/toast_order_items?select=id,toast_selection_guid&order_id=in.($dayOrderIds)&limit=1000&offset=$offset" -Headers $supabaseHeaders
+      foreach ($i in $itemResponse) { $itemIdMap[$i.toast_selection_guid] = $i.id }
+      $offset += 1000
+    } while ($itemResponse.Count -eq 1000)
+  }
 
   $dayDiscountTotal = 0
   foreach ($loc in $locations) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-OrdersBulkResilient $loc.guid $token $startUtc $endUtc $loc.name
 
       $batch = @()
       foreach ($order in $allOrders) {
@@ -610,16 +627,7 @@ foreach ($processDate in $datesToProcess) {
     $locationId = $locationIdMap[$loc.guid]
     if (-not $locationId) { continue }
     try {
-      $allOrders = @()
-      $url = "$toastApiUrl/orders/v2/ordersBulk?startDate=$startUtc&endDate=$endUtc&pageSize=100"
-      do {
-        $response = Invoke-WebRequest -Uri $url -UseBasicParsing -Headers @{
-          Authorization                  = "Bearer $token"
-          "Toast-Restaurant-External-ID" = $loc.guid
-        }
-        $allOrders += ($response.Content | ConvertFrom-Json)
-        $url = Get-NextPageUrl $response.Headers["link"]
-      } while ($url)
+      $allOrders = Get-OrdersBulkResilient $loc.guid $token $startUtc $endUtc $loc.name
 
       $batch = @()
       foreach ($order in $allOrders) {
