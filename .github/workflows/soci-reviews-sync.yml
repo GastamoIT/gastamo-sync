@@ -1,14 +1,13 @@
-name: SOCi Reviews Daily Sync
+name: SOCi Daily Sync
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 9 * * *'  # 3 AM Mountain
   workflow_dispatch:
 
 jobs:
-  sync:
+  sync-reviews:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -20,6 +19,18 @@ jobs:
           SOCI_ACCOUNT_ID: ${{ secrets.SOCI_ACCOUNT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: 
-          ./scripts/sync-soci-reviews.ps1
-          ./scripts/rebuild-soci-summary.ps1
+        run: ./scripts/sync-soci-reviews.ps1
+
+  rebuild-summary:
+    needs: sync-reviews
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Rebuild review summary
+        shell: pwsh
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: ./scripts/rebuild-soci-summary.ps1
