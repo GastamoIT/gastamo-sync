@@ -13,6 +13,7 @@ $supabaseHeaders = @{
     "Authorization" = "Bearer $supabaseKey"
     "Content-Type"  = "application/json"
     "Prefer"        = "resolution=merge-duplicates,return=minimal"
+    "X-Upsert"      = "true"
 }
 
 # ================================
