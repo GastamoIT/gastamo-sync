@@ -20,4 +20,6 @@ jobs:
           SOCI_ACCOUNT_ID: ${{ secrets.SOCI_ACCOUNT_ID }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: ./scripts/sync-soci-reviews.ps1
+        run: 
+          ./scripts/sync-soci-reviews.ps1
+          ./scripts/rebuild-soci-summary.ps1
