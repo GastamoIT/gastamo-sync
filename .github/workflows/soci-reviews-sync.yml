@@ -2,8 +2,8 @@ name: SOCi Reviews Daily Sync
 
 on:
   schedule:
-    - cron: '0 9 * * *'  # 9 AM UTC = 3 AM Mountain
-  workflow_dispatch:       # allows manual trigger from GitHub UI
+    - cron: '0 9 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
@@ -11,7 +11,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Run SOCi reviews sync
         shell: pwsh
