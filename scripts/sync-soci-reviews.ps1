@@ -8,25 +8,13 @@ $supabaseUrl    = $env:SUPABASE_URL
 $supabaseKey    = $env:SUPABASE_KEY
 
 $sociHeaders = @{ "soci-key" = $sociApiKey }
-$supabaseHeaders = @{
-    "apikey"        = $supabaseKey
-    "Authorization" = "Bearer $supabaseKey"
-    "Content-Type"  = "application/json"
-    "Prefer"        = "resolution=merge-duplicates,return=minimal"
-    "X-Upsert"      = "true"
-}
-
-# ================================
-# SOCi Daily Delta Sync
-# Run once per day
-# ================================
 
 $batchSize = 100
 $start = 0
 $totalProcessed = 0
 $totalInserted = 0
 $totalErrors = 0
-$cutoffHours = 26 # slightly more than 24 to avoid missing edge cases
+$cutoffHours = 26
 
 $cutoffDate = (Get-Date).ToUniversalTime().AddHours(-$cutoffHours)
 Write-Host "Syncing reviews updated since: $cutoffDate"
@@ -46,14 +34,6 @@ function Parse-Bool($val) {
 function Sanitize-Text($val) {
     if (-not $val) { return $null }
     return [System.Text.RegularExpressions.Regex]::Replace($val, '[^\x09\x0A\x0D\x20-\x7E]', '')
-}
-
-$sociHeaders = @{ "soci-key" = $sociApiKey }
-$supabaseHeaders = @{
-    "apikey"        = $supabaseKey
-    "Authorization" = "Bearer $supabaseKey"
-    "Content-Type"  = "application/json"
-    "Prefer"        = "resolution=merge-duplicates,return=minimal"
 }
 
 # Load location map
@@ -79,7 +59,7 @@ while ($keepGoing) {
 
     $reviews = $response.data
 
-    # Check if oldest record in this batch is older than cutoff
+    # Check if oldest record in batch is older than cutoff
     $oldestInBatch = $reviews | 
         Where-Object { $_.last_updated } | 
         Sort-Object last_updated | 
@@ -88,7 +68,6 @@ while ($keepGoing) {
     if ($oldestInBatch) {
         $oldestDate = [datetime]::Parse($oldestInBatch.last_updated)
         if ($oldestDate -lt $cutoffDate) {
-            # Filter to only records within cutoff
             $reviews = $reviews | Where-Object { 
                 $_.last_updated -and [datetime]::Parse($_.last_updated) -ge $cutoffDate 
             }
@@ -204,18 +183,36 @@ while ($keepGoing) {
         }
     }
 
-    if ($batch.Count -eq 0) { 
+    if ($batch.Count -eq 0) {
         $start += $batchSize
-        continue 
+        continue
     }
 
-    $json = $batch | ConvertTo-Json -Depth 5 -Compress
-    $json = [System.Text.RegularExpressions.Regex]::Replace($json, '\\u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}', '')
+    # Build ID list for delete
+    $reviewIds = $batch | ForEach-Object { $_.soci_review_id }
+    $idList = ($reviewIds | ForEach-Object { "`"$_`"" }) -join ","
 
     try {
+        # Step 1 - Delete existing records for these IDs
+        Invoke-RestMethod "$supabaseUrl/rest/v1/soci_reviews?soci_review_id=in.($idList)" `
+            -Method DELETE `
+            -Headers @{
+                "apikey"        = $supabaseKey
+                "Authorization" = "Bearer $supabaseKey"
+            } | Out-Null
+
+        # Step 2 - Insert fresh records
+        $json = $batch | ConvertTo-Json -Depth 5 -Compress
+        $json = [System.Text.RegularExpressions.Regex]::Replace($json, '\\u[dD][89aAbB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}', '')
+
         Invoke-RestMethod "$supabaseUrl/rest/v1/soci_reviews" `
             -Method POST `
-            -Headers $supabaseHeaders `
+            -Headers @{
+                "apikey"        = $supabaseKey
+                "Authorization" = "Bearer $supabaseKey"
+                "Content-Type"  = "application/json"
+                "Prefer"        = "return=minimal"
+            } `
             -Body $json | Out-Null
 
         $totalInserted += $batch.Count
