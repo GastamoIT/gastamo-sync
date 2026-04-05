@@ -1,0 +1,23 @@
+name: SOCi Reviews Daily Sync
+
+on:
+  schedule:
+    - cron: '0 9 * * *'  # 9 AM UTC = 3 AM Mountain
+  workflow_dispatch:       # allows manual trigger from GitHub UI
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Run SOCi reviews sync
+        shell: pwsh
+        env:
+          SOCI_API_KEY: ${{ secrets.SOCI_API_KEY }}
+          SOCI_ACCOUNT_ID: ${{ secrets.SOCI_ACCOUNT_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: ./scripts/sync-soci-reviews.ps1
