@@ -21,7 +21,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: ./scripts/sync-soci-reviews.ps1
 
-  rebuild-summary:
+rebuild-summary:
     needs: sync-reviews
     runs-on: ubuntu-latest
     steps:
@@ -32,5 +32,5 @@ jobs:
         shell: pwsh
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: ./scripts/rebuild-soci-summary.ps1
