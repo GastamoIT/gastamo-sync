@@ -24,7 +24,16 @@ jobs:
           SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
         run: |
           ./scripts/gastamo-daily-sync.ps1
-
+      
+      - name: Sync deferred sales
+        shell: pwsh
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          DEFERRED_LOOKBACK_DAYS: 4
+        run: |
+          ./scripts/gastamo-sync-deferred-sales.ps1
+          
       - name: Upload log
         if: always()
         uses: actions/upload-artifact@v4
