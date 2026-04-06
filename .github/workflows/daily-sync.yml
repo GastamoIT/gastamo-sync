@@ -2,7 +2,7 @@ name: Gastamo Daily Sync
 
 on:
   schedule:
-    - cron: '0 12 * * *'  # 6:00 AM Mountain Time (UTC-6 MDT / UTC-7 MST)
+    - cron: '0 10 * * *'  # 6:00 AM Mountain Time (UTC-6 MDT / UTC-7 MST)
   workflow_dispatch:        # allows manual trigger from GitHub UI
 
 jobs:
