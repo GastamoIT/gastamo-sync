@@ -153,6 +153,7 @@ function Invoke-WithRetry {
     [int]$BaseDelaySeconds = 5,
     [string]$Label = "API call"
   )
+  $authRetryUsed = $false
   for ($attempt = 1; $attempt -le ($MaxRetries + 1); $attempt++) {
     try {
       return (& $ScriptBlock)
@@ -169,6 +170,17 @@ function Invoke-WithRetry {
       # Fallback: parse 3-digit code from error message
       elseif ($_.Exception.Message -match '\b(\d{3})\b') {
         $statusCode = [int]$matches[1]
+      }
+      # Transient 401 from Toast: force a token refresh and retry once.
+      # Toast occasionally returns 401 on cashmgmt endpoints even when the
+      # token is valid for other endpoints in the same run. A fresh token
+      # almost always clears it.
+      if ($statusCode -eq 401 -and -not $authRetryUsed) {
+        $authRetryUsed = $true
+        Write-Log "  AUTH RETRY for $Label (HTTP 401) — refreshing token" Yellow
+        Refresh-TokenIfNeeded -Force
+        Start-Sleep -Seconds 2
+        continue
       }
       # Only retry on 500, 502, 503, 504, 429
       $retryable = $statusCode -in @(500, 502, 503, 504, 429)
@@ -278,8 +290,9 @@ function Strip-HelperFields($rows) {
 }
 
 function Refresh-TokenIfNeeded {
+  param([switch]$Force)
   $minutesElapsed = ((Get-Date) - $script:tokenAcquiredAt).TotalMinutes
-  if ($minutesElapsed -gt 50) {
+  if ($Force -or $minutesElapsed -gt 50) {
     try {
       $authBody = @{ clientId = $clientId; clientSecret = $clientSecret; userAccessType = "TOAST_MACHINE_CLIENT" } | ConvertTo-Json
       $authResponse = Invoke-RestMethod -Uri "$toastApiUrl/authentication/v1/authentication/login" -Method POST -Body $authBody -ContentType "application/json"
